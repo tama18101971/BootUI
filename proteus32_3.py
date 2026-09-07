@@ -151,30 +151,39 @@ def wait_response(ser, timeout=TIMEOUT_CMD):
 
 
 def wait_read_response(ser, timeout=TIMEOUT_CMD):
-    """Read a READ frame: AA 55 84 00 <64B> CKL CKH 55 AA (76 bytes).
+    """Read a READ frame: AA 55 84 00 <64B> CKL CKH 55 AA (72 bytes).
 
-    Validates the frame and the checksum. Returns (data, None) on success,
+    Tolerates the variant with a 4-byte address echo before the data
+    (76 bytes total, as flashed on some benches): the layout is detected
+    by checksum validation. Returns (data, None) on success,
     (None, error_message) otherwise.
     """
-    expected_len = 6 + BLOCK_SIZE + 4
+    min_len = 4 + BLOCK_SIZE + 4       # header + data + CK + tail = 72
+    max_len = min_len + 4              # room for an eventual addr echo
     buf = bytearray()
     deadline = time.time() + timeout
     while time.time() < deadline:
         if ser.in_waiting:
-            buf += ser.read(min(ser.in_waiting, expected_len - len(buf)))
-            if len(buf) >= expected_len:
+            buf += ser.read(min(ser.in_waiting, max_len - len(buf)))
+            if len(buf) >= min_len:
                 break
         time.sleep(0.001)
-    if len(buf) < expected_len:
-        return None, "неполный кадр READ (получено %d из %d байт)" % (len(buf), expected_len)
-    if buf[0] != SYNC_HEAD1 or buf[1] != SYNC_HEAD2 or buf[2] != CMD_IAP_READ or buf[3] != 0x00:
-        return None, "неверный заголовок кадра READ"
-    ck = (CMD_IAP_READ + 0x00 + sum(buf[4:4 + BLOCK_SIZE])) & 0xFFFF
-    if buf[70] != (ck & 0xFF) or buf[71] != ((ck >> 8) & 0xFF):
-        return None, "контрольная сумма READ не совпадает"
-    if buf[72] != SYNC_HEAD2 or buf[73] != SYNC_HEAD1:
-        return None, "неверный хвост кадра READ"
-    return bytes(buf[4:4 + BLOCK_SIZE]), None
+    if len(buf) < min_len:
+        return None, "неполный кадр READ (получено %d байт)" % len(buf)
+
+    for skip in (0, 4):                # 0 = no echo, 4 = addr echo before data
+        if len(buf) < 4 + skip + BLOCK_SIZE + 4:
+            continue
+        data = buf[4 + skip:4 + skip + BLOCK_SIZE]
+        ck = (CMD_IAP_READ + 0x00 + sum(data)) & 0xFFFF
+        ck_off = 4 + skip + BLOCK_SIZE
+        tail = buf[ck_off + 2:ck_off + 4]
+        if (buf[ck_off] == (ck & 0xFF) and buf[ck_off + 1] == ((ck >> 8) & 0xFF)
+                and tail == bytes([SYNC_HEAD2, SYNC_HEAD1])):
+            return bytes(data), None
+        if buf[0] != SYNC_HEAD1 or buf[1] != SYNC_HEAD2 or buf[2] != CMD_IAP_READ or buf[3] != 0x00:
+            return None, "неверный заголовок кадра READ"
+    return None, "контрольная сумма READ не совпадает"
 
 
 def send_packet(ser, packet, timeout=TIMEOUT_CMD, expect_response=True):
@@ -202,6 +211,20 @@ def send_packet(ser, packet, timeout=TIMEOUT_CMD, expect_response=True):
             return False, status
 
     return False, None
+
+
+def send_end_best_effort(ser, timeout=2.0):
+    """Send END once (no retries) and wait for its ACK best-effort.
+
+    The bootloader jumps into the application right after END, so the ACK
+    can be lost on the wire; per TZ 4.3 p.5 a missing ACK is not an error.
+    Returns (ok, status): ok=True only on a confirmed ST_OK ACK.
+    """
+    ser.reset_input_buffer()
+    ser.write(make_packet(CMD_IAP_END))
+    ser.flush()
+    ok, status, _raw = parse_base_response(wait_response(ser, timeout=timeout))
+    return ok, status
 
 
 def check_size(size):
@@ -341,9 +364,9 @@ def cmd_write(port, filepath, baudrate, do_verify):
             print("▶ Verify".ljust(40), end="", flush=True)
             print("SKIPPED (--no-verify)")
 
-        # ---- 4. END (ACK may be lost in the reset; not an error) ----
+        # ---- 4. END (best-effort ACK: the device may already run the app) ----
         print("▶ Starting application...".ljust(40), end="", flush=True)
-        send_packet(ser, make_packet(CMD_IAP_END), expect_response=False)
+        send_end_best_effort(ser)
         time.sleep(0.5)
         print("OK")
         print()
@@ -378,7 +401,7 @@ def cmd_erase_only(port, baudrate):
         if not ok:
             return fail_with_hint(status)
         print("OK")
-        send_packet(ser, make_packet(CMD_IAP_END), expect_response=False)
+        send_end_best_effort(ser)
         time.sleep(0.3)
         return 0
     finally:
@@ -440,9 +463,11 @@ def cmd_go(port, baudrate):
     try:
         ser.reset_input_buffer()
         ser.reset_output_buffer()
-        send_packet(ser, make_packet(CMD_IAP_END), expect_response=False)
-        time.sleep(0.5)
-        print("✓ END sent, device reset into the application")
+        ok, _status = send_end_best_effort(ser)
+        if ok:
+            print("✓ END acknowledged, device reset into the application")
+        else:
+            print("✓ END sent (no ACK - device already runs the application)")
         return 0
     finally:
         ser.close()

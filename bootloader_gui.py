@@ -235,9 +235,14 @@ class FlasherApp:
         self.log(f"Found {len(port_list)} COM port(s)")
 
     def log(self, message):
+        # tk.Text is not thread-safe; flash_thread() logs from a worker
+        # thread, so all widget access is marshalled to the main loop.
+        line = f"[{time.strftime('%H:%M:%S')}] {message}\n"
+        self.root.after(0, self._append_log, line)
+
+    def _append_log(self, line):
         self.log_text.config(state=tk.NORMAL)
-        timestamp = time.strftime("%H:%M:%S")
-        self.log_text.insert(tk.END, f"[{timestamp}] {message}\n")
+        self.log_text.insert(tk.END, line)
         self.log_text.see(tk.END)
         self.log_text.config(state=tk.DISABLED)
 
@@ -369,7 +374,16 @@ class FlasherApp:
             self.log(f"Verify complete ({time.time() - verify_start:.2f}s)")
 
             self.log("Starting application...")
-            send_packet(ser, make_packet(CMD_IAP_END), expect_response=False)
+            # END is sent once without retries; the ACK may be lost when the
+            # bootloader jumps into the application, which is not an error.
+            ser.reset_input_buffer()
+            ser.write(make_packet(CMD_IAP_END))
+            ser.flush()
+            ok, _status = parse_base_response(wait_response(ser, timeout=2.0))
+            if ok:
+                self.log("Application start acknowledged")
+            else:
+                self.log("END ACK not received - device already switched to the application (not an error)")
             time.sleep(0.5)
 
             total_time = time.time() - total_start
