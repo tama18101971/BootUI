@@ -17,6 +17,7 @@ CMD_IAP_PROM   = 0x80
 CMD_IAP_ERASE  = 0x81
 CMD_IAP_VERIFY = 0x82
 CMD_IAP_END    = 0x83
+CMD_IAP_READ   = 0x84
 
 ST_OK         = 0x00
 ST_ERR        = 0x01
@@ -47,7 +48,7 @@ def make_packet(cmd, addr=FLASH_BASE, data=None):
     of CMD + LEN + all payload bytes. ERASE carries a 4-byte addr stub
     (ignored by the bootloader but included in the checksum); END carries
     nothing; VERIFY carries a 4-byte addr stub plus 64 expected bytes; PROM
-    carries 64 data bytes.
+    carries 64 data bytes; READ carries a 4-byte addr (rev-2 probe only).
     """
     if cmd == CMD_IAP_ERASE:
         payload = bytearray([cmd, 0]) + struct.pack("<I", addr)
@@ -60,6 +61,9 @@ def make_packet(cmd, addr=FLASH_BASE, data=None):
         payload = bytearray([cmd, BLOCK_SIZE])
         payload += struct.pack("<I", addr)
         payload += data
+    elif cmd == CMD_IAP_READ:
+        payload = bytearray([cmd, 4])
+        payload += struct.pack("<I", addr)
     else:
         raise ValueError("unknown command 0x%02X" % cmd)
 
@@ -110,7 +114,7 @@ def wait_response(ser, timeout=TIMEOUT_CMD):
     return bytes(buf)
 
 
-def send_packet(ser, packet, timeout=TIMEOUT_CMD, expect_response=True):
+def send_packet(ser, packet, timeout=TIMEOUT_CMD):
     """Send a frame with retries (3x; input buffer reset before each attempt).
 
     Returns (ok, status): ok=True on ACK; on failure status is the ST error
@@ -123,9 +127,6 @@ def send_packet(ser, packet, timeout=TIMEOUT_CMD, expect_response=True):
         ser.write(packet)
         ser.flush()
 
-        if not expect_response:
-            return True, ST_OK
-
         ok, status = parse_base_response(wait_response(ser, timeout))
         if ok:
             return True, status
@@ -133,6 +134,35 @@ def send_packet(ser, packet, timeout=TIMEOUT_CMD, expect_response=True):
             return False, status
 
     return False, None
+
+
+def probe_protocol_v2(ser, timeout=TIMEOUT_CMD):
+    """Confirm the device runs bootloader rev 2 before any destructive command.
+
+    READ (0x84) exists only in rev 2: rev 2 answers with a 72-byte data
+    frame, rev 1 answers with an error frame or stays silent — and on rev 1
+    the identical ERASE/END frames damage WL_FLASH settings. Light check:
+    header, CMD/LEN and tail of the response are enough to tell the
+    revisions apart. Returns (ok, error_message).
+    """
+    ser.reset_input_buffer()
+    ser.write(make_packet(CMD_IAP_READ, addr=FLASH_BASE))
+    ser.flush()
+    buf = bytearray()
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if ser.in_waiting:
+            buf += ser.read(min(ser.in_waiting, 72 - len(buf)))
+            if len(buf) >= 72:
+                break
+        time.sleep(0.001)
+    if len(buf) >= 72:
+        if (buf[0] == SYNC_HEAD1 and buf[1] == SYNC_HEAD2
+                and buf[2] == CMD_IAP_READ and buf[3] == 0x00
+                and buf[-2:] == bytes((SYNC_HEAD2, SYNC_HEAD1))):
+            return True, None
+        return False, "unexpected READ response from bootloader"
+    return False, "no READ response (device in IAP mode? bootloader rev 1?)"
 
 
 class FlasherApp:
@@ -320,6 +350,14 @@ class FlasherApp:
 
             ser.reset_input_buffer()
             ser.reset_output_buffer()
+
+            self.log("Checking bootloader revision (READ probe)...")
+            probe_ok, probe_err = probe_protocol_v2(ser)
+            if not probe_ok:
+                self.log("ERROR: %s" % probe_err)
+                self.log("If the board runs bootloader rev 1, update it via WCH-Link first:")
+                self.log("ERASE/END of this tool would damage WL_FLASH settings on rev 1.")
+                return
 
             self.log("Erasing app area (WL_FLASH untouched)...")
             erase_start = time.time()

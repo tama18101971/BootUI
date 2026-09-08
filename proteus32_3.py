@@ -119,22 +119,22 @@ def make_packet(cmd, addr=FLASH_BASE, data=None):
     ])
 
 
-def parse_base_response(raw, timeout=None):
-    """Parse a 6-byte base response. Returns (ok, status, raw).
+def parse_base_response(raw):
+    """Parse a 6-byte base response. Returns (ok, status).
 
     ok = True only for AA 55 00 00 55 AA (ST_OK). For other statuses ok=False,
     status carries the code so the caller can spell out the error.
     """
     if raw is None:
-        return False, None, b""
+        return False, None
     if len(raw) < 6:
-        return False, None, raw
+        return False, None
     if raw[0] != SYNC_HEAD1 or raw[1] != SYNC_HEAD2 or raw[2] != 0x00:
-        return False, None, raw
+        return False, None
     status = raw[3]
     if raw[4] != SYNC_HEAD2 or raw[5] != SYNC_HEAD1:
-        return False, None, raw
-    return status == ST_OK, status, raw
+        return False, None
+    return status == ST_OK, status
 
 
 def wait_response(ser, timeout=TIMEOUT_CMD):
@@ -160,12 +160,18 @@ def wait_read_response(ser, timeout=TIMEOUT_CMD):
     """
     min_len = 4 + BLOCK_SIZE + 4       # header + data + CK + tail = 72
     max_len = min_len + 4              # room for an eventual addr echo
+    tail = bytes([SYNC_HEAD2, SYNC_HEAD1])
     buf = bytearray()
     deadline = time.time() + timeout
     while time.time() < deadline:
         if ser.in_waiting:
             buf += ser.read(min(ser.in_waiting, max_len - len(buf)))
-            if len(buf) >= min_len:
+            if len(buf) >= max_len:
+                break
+            # Stop only on a complete frame candidate: breaking at min_len
+            # could truncate the 76-byte echo variant on a split USB-serial
+            # read, burning all retries on a mis-timed split.
+            if len(buf) >= min_len and buf[-2:] == tail:
                 break
         time.sleep(0.001)
     if len(buf) < min_len:
@@ -186,7 +192,7 @@ def wait_read_response(ser, timeout=TIMEOUT_CMD):
     return None, "контрольная сумма READ не совпадает"
 
 
-def send_packet(ser, packet, timeout=TIMEOUT_CMD, expect_response=True):
+def send_packet(ser, packet, timeout=TIMEOUT_CMD):
     """Send a packet with retries (3x, reset_input_buffer between attempts).
 
     Returns (ok, status_or_error):
@@ -198,11 +204,7 @@ def send_packet(ser, packet, timeout=TIMEOUT_CMD, expect_response=True):
         ser.write(packet)
         ser.flush()
 
-        if not expect_response:
-            return True, ST_OK
-
-        raw = wait_response(ser, timeout)
-        ok, status, raw = parse_base_response(raw)
+        ok, status = parse_base_response(wait_response(ser, timeout))
         if ok:
             return True, status
         if status is not None:
@@ -223,8 +225,35 @@ def send_end_best_effort(ser, timeout=2.0):
     ser.reset_input_buffer()
     ser.write(make_packet(CMD_IAP_END))
     ser.flush()
-    ok, status, _raw = parse_base_response(wait_response(ser, timeout=timeout))
+    ok, status = parse_base_response(wait_response(ser, timeout=timeout))
     return ok, status
+
+
+def probe_protocol_v2(ser, timeout=TIMEOUT_CMD):
+    """Confirm the device runs bootloader rev 2 before any destructive command.
+
+    READ (0x84) exists only in rev 2: a rev-2 device answers with a 72-byte
+    data frame, rev 1 answers with an error frame or stays silent — and on
+    rev 1 the identical ERASE/END frames damage WL_FLASH settings. Returns
+    (data, None) on success, (None, error_message) otherwise.
+    """
+    ser.reset_input_buffer()
+    ser.write(make_packet(CMD_IAP_READ, addr=FLASH_BASE))
+    ser.flush()
+    return wait_read_response(ser, timeout=timeout)
+
+
+def fail_no_v2(err):
+    print("FAILED")
+    print(
+        "Загрузчик не подтвердил протокол rev 2 (READ 0x84): %s\n"
+        "Проверьте: устройство в IAP-режиме (питание при зажатой кнопке),\n"
+        "проводку PD5/PD6 и скорость 460800.\n"
+        "Если на плате загрузчик rev 1 — обновите его через WCH-Link:\n"
+        "ERASE/END этого скрипта на rev 1 повреждают настройки WL_FLASH."
+        % (err or "нет ответа")
+    )
+    return 1
 
 
 def check_size(size):
@@ -295,6 +324,13 @@ def cmd_write(port, filepath, baudrate, do_verify):
     try:
         ser.reset_input_buffer()
         ser.reset_output_buffer()
+
+        # ---- 0. Protocol probe (READ exists only in rev 2) ----
+        print("▶ Checking bootloader revision...".ljust(40), end="", flush=True)
+        probe_data, probe_err = probe_protocol_v2(ser)
+        if probe_data is None:
+            return fail_no_v2(probe_err)
+        print("OK (rev 2)")
 
         # ---- 1. ERASE (timeout 10 s, ~1 s of real erase) ----
         stage_start = time.time()
@@ -396,6 +432,11 @@ def cmd_erase_only(port, baudrate):
     try:
         ser.reset_input_buffer()
         ser.reset_output_buffer()
+        print("▶ Checking bootloader revision...".ljust(40), end="", flush=True)
+        probe_data, probe_err = probe_protocol_v2(ser)
+        if probe_data is None:
+            return fail_no_v2(probe_err)
+        print("OK (rev 2)")
         print("▶ Erasing app area (WL_FLASH untouched)...".ljust(40), end="", flush=True)
         ok, status = send_packet(ser, make_packet(CMD_IAP_ERASE), timeout=TIMEOUT_ERASE)
         if not ok:
@@ -409,6 +450,9 @@ def cmd_erase_only(port, baudrate):
 
 
 def cmd_dump(port, baudrate, filepath, addr, length):
+    if length <= 0:
+        print("ERROR: --len must be a positive byte count.")
+        return 1
     if addr % BLOCK_SIZE:
         print("ERROR: --addr must be 64-byte aligned (page granularity).")
         return 1
@@ -463,6 +507,11 @@ def cmd_go(port, baudrate):
     try:
         ser.reset_input_buffer()
         ser.reset_output_buffer()
+        print("▶ Checking bootloader revision...".ljust(40), end="", flush=True)
+        probe_data, probe_err = probe_protocol_v2(ser)
+        if probe_data is None:
+            return fail_no_v2(probe_err)
+        print("OK (rev 2)")
         ok, _status = send_end_best_effort(ser)
         if ok:
             print("✓ END acknowledged, device reset into the application")
