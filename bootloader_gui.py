@@ -1,5 +1,4 @@
 import os
-import struct
 import time
 import threading
 import tkinter as tk
@@ -7,91 +6,28 @@ from tkinter import ttk, filedialog, messagebox
 import serial
 import serial.tools.list_ports
 
+from proteus32_protocol import (
+    BLOCK_SIZE,
+    CMD_IAP_ERASE,
+    CMD_IAP_PROM,
+    CMD_IAP_VERIFY,
+    FLASH_BASE,
+    MAX_FLASH_SIZE,
+    PROTOCOL_REV,
+    ST_DICT,
+    ST_ERR_VERIFY,
+    TIMEOUT_ERASE,
+    make_packet,
+    open_port,
+    probe_protocol_v2,
+    send_end_best_effort,
+    send_packet,
+)
+
 VERSION = "2.1"
-PROTOCOL_REV = 2  # bootloader revision 2 (WL_FLASH-safe); incompatible with v1
-
-SYNC_HEAD1 = 0xAA
-SYNC_HEAD2 = 0x55
-
-CMD_IAP_PROM   = 0x80
-CMD_IAP_ERASE  = 0x81
-CMD_IAP_VERIFY = 0x82
-CMD_IAP_END    = 0x83
-CMD_IAP_READ   = 0x84
-
-ST_OK         = 0x00
-ST_ERR        = 0x01
-ST_ERR_RANGE  = 0x02
-ST_ERR_VERIFY = 0x03
-ST_DICT = {
-    ST_ERR:        "command execution error",
-    ST_ERR_RANGE:  "address out of app area (WL_FLASH protection)",
-    ST_ERR_VERIFY: "VERIFY: data mismatch",
-}
-
-FLASH_BASE = 0x08000000
-FLASH_APP_END = 0x08003F00   # end of app area, start of WL_FLASH settings
-MAX_FLASH_SIZE = FLASH_APP_END - FLASH_BASE  # 16128
-BLOCK_SIZE = 64
-MAX_RETRIES = 3
-
-TIMEOUT_ERASE = 10.0  # 252 x 64 B pages, ~1 s of real erase
-TIMEOUT_CMD = 3.0
 
 BAUD_RATES = [9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600]
-
-
-def make_packet(cmd, addr=FLASH_BASE, data=None):
-    """Build a request frame: AA 55 CMD LEN PAYLOAD CKL CKH 55 AA.
-
-    Protocol rev 2 (BOOTLOADER_TZ.md 3.5): the checksum is the 16-bit LE sum
-    of CMD + LEN + all payload bytes. ERASE carries a 4-byte addr stub
-    (ignored by the bootloader but included in the checksum); END carries
-    nothing; VERIFY carries a 4-byte addr stub plus 64 expected bytes; PROM
-    carries 64 data bytes; READ carries a 4-byte addr (rev-2 probe only).
-    """
-    if cmd == CMD_IAP_ERASE:
-        payload = bytearray([cmd, 0]) + struct.pack("<I", addr)
-    elif cmd == CMD_IAP_END:
-        payload = bytearray([cmd, 0])
-    elif cmd == CMD_IAP_PROM:
-        payload = bytearray([cmd, len(data)])
-        payload += data
-    elif cmd == CMD_IAP_VERIFY:
-        payload = bytearray([cmd, BLOCK_SIZE])
-        payload += struct.pack("<I", addr)
-        payload += data
-    elif cmd == CMD_IAP_READ:
-        payload = bytearray([cmd, 4])
-        payload += struct.pack("<I", addr)
-    else:
-        raise ValueError("unknown command 0x%02X" % cmd)
-
-    checksum = sum(payload) & 0xFFFF
-    return bytes([
-        SYNC_HEAD1,
-        SYNC_HEAD2,
-        *payload,
-        checksum & 0xFF,
-        (checksum >> 8) & 0xFF,
-        SYNC_HEAD2,
-        SYNC_HEAD1,
-    ])
-
-def parse_base_response(raw):
-    """Parse the 6-byte base response AA 55 00 ST 55 AA.
-
-    Returns (ok, status): ok is True only for ST_OK; status carries the ST
-    code, or None when the frame is missing or garbled.
-    """
-    if raw is None or len(raw) < 6:
-        return False, None
-    if raw[0] != SYNC_HEAD1 or raw[1] != SYNC_HEAD2 or raw[2] != 0x00:
-        return False, None
-    if raw[4] != SYNC_HEAD2 or raw[5] != SYNC_HEAD1:
-        return False, None
-    status = raw[3]
-    return status == ST_OK, status
+BOOTLOADER_BAUD = 460800  # the only rate the fixed BRR (0x34 @ HSI 24 MHz) supports
 
 
 def describe_status(status):
@@ -99,70 +35,6 @@ def describe_status(status):
     if status is None:
         return "no response from bootloader (check IAP mode: power on with button held)"
     return ST_DICT.get(status, "unknown status 0x%02X" % status)
-
-
-def wait_response(ser, timeout=TIMEOUT_CMD):
-    """Read one base response frame (6 bytes). Returns raw bytes (may be short)."""
-    buf = bytearray()
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        if ser.in_waiting:
-            buf += ser.read(min(ser.in_waiting, 6 - len(buf)))
-            if len(buf) >= 6:
-                break
-        time.sleep(0.001)
-    return bytes(buf)
-
-
-def send_packet(ser, packet, timeout=TIMEOUT_CMD):
-    """Send a frame with retries (3x; input buffer reset before each attempt).
-
-    Returns (ok, status): ok=True on ACK; on failure status is the ST error
-    code reported by the bootloader, or None when it never answered. An
-    explicit error status is not retried: resending cannot fix a guard or
-    verify failure.
-    """
-    for _ in range(MAX_RETRIES):
-        ser.reset_input_buffer()
-        ser.write(packet)
-        ser.flush()
-
-        ok, status = parse_base_response(wait_response(ser, timeout))
-        if ok:
-            return True, status
-        if status is not None:
-            return False, status
-
-    return False, None
-
-
-def probe_protocol_v2(ser, timeout=TIMEOUT_CMD):
-    """Confirm the device runs bootloader rev 2 before any destructive command.
-
-    READ (0x84) exists only in rev 2: rev 2 answers with a 72-byte data
-    frame, rev 1 answers with an error frame or stays silent — and on rev 1
-    the identical ERASE/END frames damage WL_FLASH settings. Light check:
-    header, CMD/LEN and tail of the response are enough to tell the
-    revisions apart. Returns (ok, error_message).
-    """
-    ser.reset_input_buffer()
-    ser.write(make_packet(CMD_IAP_READ, addr=FLASH_BASE))
-    ser.flush()
-    buf = bytearray()
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        if ser.in_waiting:
-            buf += ser.read(min(ser.in_waiting, 72 - len(buf)))
-            if len(buf) >= 72:
-                break
-        time.sleep(0.001)
-    if len(buf) >= 72:
-        if (buf[0] == SYNC_HEAD1 and buf[1] == SYNC_HEAD2
-                and buf[2] == CMD_IAP_READ and buf[3] == 0x00
-                and buf[-2:] == bytes((SYNC_HEAD2, SYNC_HEAD1))):
-            return True, None
-        return False, "unexpected READ response from bootloader"
-    return False, "no READ response (device in IAP mode? bootloader rev 1?)"
 
 
 class FlasherApp:
@@ -174,7 +46,7 @@ class FlasherApp:
 
         self.firmware_path = tk.StringVar()
         self.com_port = tk.StringVar()
-        self.baud_rate = tk.IntVar(value=460800)
+        self.baud_rate = tk.IntVar(value=BOOTLOADER_BAUD)
         self.is_flashing = False
 
         self.create_widgets()
@@ -220,6 +92,7 @@ class FlasherApp:
             width=15
         )
         self.baud_combo.pack(side=tk.LEFT, padx=(10, 10))
+        self.baud_combo.bind("<<ComboboxSelected>>", self.on_baud_selected)
 
         log_frame = ttk.LabelFrame(main_frame, text="Log", padding=10)
         log_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
@@ -242,6 +115,18 @@ class FlasherApp:
 
         self.file_info_label = ttk.Label(btn_frame, text="No file selected")
         self.file_info_label.pack(side=tk.LEFT)
+
+    def on_baud_selected(self, _event=None):
+        baud = self.baud_rate.get()
+        if baud != BOOTLOADER_BAUD:
+            messagebox.showwarning(
+                "Unsupported baud rate",
+                "The bootloader firmware uses a fixed USART divider "
+                "(BRR = 0x34 at HSI 24 MHz), so only %d baud is supported.\n"
+                "Any other value cannot communicate with the device.\n"
+                "Reverting to %d." % (BOOTLOADER_BAUD, BOOTLOADER_BAUD),
+            )
+            self.baud_rate.set(BOOTLOADER_BAUD)
 
     def browse_file(self):
         filepath = filedialog.askopenfilename(
@@ -337,14 +222,7 @@ class FlasherApp:
             self.log(f"Size: {len(data) / 1024:.1f} KiB ({blocks} x {BLOCK_SIZE} B blocks)")
             self.log("=" * 50)
 
-            ser = serial.Serial(
-                port=port,
-                baudrate=baudrate,
-                bytesize=serial.EIGHTBITS,
-                parity=serial.PARITY_NONE,
-                stopbits=serial.STOPBITS_ONE,
-                timeout=2,
-            )
+            ser = open_port(port, baudrate)
 
             total_start = time.time()
 
@@ -352,9 +230,9 @@ class FlasherApp:
             ser.reset_output_buffer()
 
             self.log("Checking bootloader revision (READ probe)...")
-            probe_ok, probe_err = probe_protocol_v2(ser)
-            if not probe_ok:
-                self.log("ERROR: %s" % probe_err)
+            probe_data, probe_err = probe_protocol_v2(ser)
+            if probe_data is None:
+                self.log("ERROR: bootloader rev 2 not confirmed: %s" % probe_err)
                 self.log("If the board runs bootloader rev 1, update it via WCH-Link first:")
                 self.log("ERASE/END of this tool would damage WL_FLASH settings on rev 1.")
                 return
@@ -414,10 +292,7 @@ class FlasherApp:
             self.log("Starting application...")
             # END is sent once without retries; the ACK may be lost when the
             # bootloader jumps into the application, which is not an error.
-            ser.reset_input_buffer()
-            ser.write(make_packet(CMD_IAP_END))
-            ser.flush()
-            ok, _status = parse_base_response(wait_response(ser, timeout=2.0))
+            ok, _status = send_end_best_effort(ser)
             if ok:
                 self.log("Application start acknowledged")
             else:
