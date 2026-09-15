@@ -11,7 +11,7 @@ import queue
 import ctypes
 import threading
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from tkinter import ttk, filedialog
 import serial
 import serial.tools.list_ports
 
@@ -312,6 +312,69 @@ class FlasherWorker(threading.Thread):
                 except Exception:
                     pass
             self.queue.put(("flash_done", success, "Прошивка успешно завершена!" if success else "Ошибка прошивки"))
+
+
+# ---------------------------------------------------------------------------
+# Themed message dialog (replaces native tkinter.messagebox)
+# ---------------------------------------------------------------------------
+
+class ThemedMessageBox(tk.Toplevel):
+    """Modal sv-ttk themed dialog replacing native Win32 MessageBox.
+
+    Native messageboxes always follow the SYSTEM app theme and cannot be
+    rendered dark when the application itself is switched to dark mode.
+    """
+
+    ICONS = {"info": ("\u24D8", "#569CD6"), "success": ("\u2713", "#4EC9B0"),
+             "warning": ("\u26A0", "#CE9178"), "error": ("\u2716", "#F44747")}
+    ICONS_LIGHT = {"info": ("\u24D8", "#005FB8"), "success": ("\u2713", "#107C41"),
+                   "warning": ("\u26A0", "#B25900"), "error": ("\u2716", "#C42B1C")}
+
+    def __init__(self, parent, title, message, kind="info", dark=True):
+        super().__init__(parent)
+        self.dark = dark
+        self.title(title)
+        self.resizable(False, False)
+        self.transient(parent)
+        self.withdraw()
+
+        icon_char, icon_color = (self.ICONS if dark else self.ICONS_LIGHT).get(kind, self.ICONS["info"])
+
+        body = ttk.Frame(self, padding=(22, 18))
+        body.pack(fill="both", expand=True)
+
+        top = ttk.Frame(body)
+        top.pack(fill="x")
+        top.columnconfigure(1, weight=1)
+
+        ttk.Label(top, text=icon_char, foreground=icon_color,
+                  font=("Segoe UI", 18, "bold")).grid(row=0, column=0, sticky="nw", padx=(0, 14))
+        ttk.Label(top, text=message, wraplength=340, justify="left",
+                  font=("Segoe UI", 10)).grid(row=0, column=1, sticky="nw")
+
+        btn_row = ttk.Frame(body)
+        btn_row.pack(fill="x", pady=(18, 0))
+        ok_btn = ttk.Button(btn_row, text="OK", style="Accent.TButton",
+                            width=10, command=self.destroy)
+        ok_btn.pack(side="right")
+
+        self.bind("<Return>", lambda e: self.destroy())
+        self.bind("<Escape>", lambda e: self.destroy())
+        ok_btn.focus_set()
+
+        self.update_idletasks()
+        px, py = parent.winfo_rootx(), parent.winfo_rooty()
+        pw, ph = parent.winfo_width(), parent.winfo_height()
+        w, h = self.winfo_reqwidth(), self.winfo_reqheight()
+        self.geometry(f"+{max(px + (pw - w) // 2, 0)}+{max(py + (ph - h) // 3, 0)}")
+        self.deiconify()
+        self.grab_set()
+
+        if kind in ("warning", "error"):
+            self.bell()
+
+        if not set_window_dark_titlebar(self, dark):
+            self.bind("<Map>", lambda e: set_window_dark_titlebar(self, dark), add="+")
 
 
 # ---------------------------------------------------------------------------
@@ -763,7 +826,7 @@ class FlasherApp:
     def save_log(self):
         content = self.log_text.get("1.0", tk.END).strip()
         if not content:
-            messagebox.showinfo("Сохранение журнала", "Журнал пуст.")
+            self.show_dialog("info", "Сохранение журнала", "Журнал пуст.")
             return
         filename = filedialog.asksaveasfilename(
             title="Сохранить журнал операций",
@@ -776,7 +839,7 @@ class FlasherApp:
                     f.write(content)
                 self.status_left.config(text=f"Журнал сохранен в {os.path.basename(filename)}")
             except Exception as e:
-                messagebox.showerror("Ошибка сохранения", f"Не удалось сохранить файл:\n{e}")
+                self.show_dialog("error", "Ошибка сохранения", f"Не удалось сохранить файл:\n{e}")
 
     # -----------------------------------------------------------------------
     # Probe Device (Non-destructive Check)
@@ -788,7 +851,7 @@ class FlasherApp:
 
         port = self.get_selected_port()
         if not port:
-            messagebox.showwarning("Проверка связи", "Выберите COM-порт для проверки.")
+            self.show_dialog("warning", "Проверка связи", "Выберите COM-порт для проверки.")
             return
 
         self.probe_active = True
@@ -834,6 +897,10 @@ class FlasherApp:
     # Flash Process Management
     # -----------------------------------------------------------------------
 
+    def show_dialog(self, kind, title, message):
+        """Modal themed dialog matching the current app theme."""
+        self.root.wait_window(ThemedMessageBox(self.root, title, message, kind, self.dark_mode))
+
     def _set_ui_busy(self, mode):
         """Single source of truth for control states: 'idle' | 'flash' | 'probe'."""
         if mode == "flash":
@@ -863,12 +930,12 @@ class FlasherApp:
             return
 
         if not self.validate_file():
-            messagebox.showwarning("Предупреждение", "Пожалуйста, выберите корректный файл прошивки (.bin).")
+            self.show_dialog("warning", "Предупреждение", "Пожалуйста, выберите корректный файл прошивки (.bin).")
             return
 
         port = self.get_selected_port()
         if not port:
-            messagebox.showwarning("Предупреждение", "Пожалуйста, выберите COM-порт устройства.")
+            self.show_dialog("warning", "Предупреждение", "Пожалуйста, выберите COM-порт устройства.")
             return
 
         self.is_running = True
@@ -901,18 +968,21 @@ class FlasherApp:
 
     def process_queue(self):
         """Handle background thread events safely on the Tk main thread."""
-        try:
-            if not self.root.winfo_exists():
-                return
-        except tk.TclError:
+        # Themed dialogs below run a nested event loop (wait_window), which
+        # re-enters this callback via the pending after() tick. Guard so the
+        # polling chain stays exactly one — the outer tick reschedules when
+        # its dialog closes; nested ticks just return.
+        if getattr(self, "_pq_running", False):
             return
-
+        self._pq_running = True
+        pending_phase = None
+        pending_progress = None
         try:
-            # Worker emits progress/phase per 64-byte block (hundreds per
-            # second); only the latest value per drain tick is visible, so
-            # coalesce them and touch each widget once.
-            pending_phase = None
-            pending_progress = None
+            try:
+                if not self.root.winfo_exists():
+                    return
+            except tk.TclError:
+                return
 
             while True:
                 item = self.msg_queue.get_nowait()
@@ -948,27 +1018,35 @@ class FlasherApp:
                         self.pct_lbl.config(text="100%")
                         self.phase_lbl.config(text="✓ Прошивка успешно завершена!")
                         self.status_left.config(text="Прошивка завершена успешно")
-                        messagebox.showinfo("Успешно", "Прошивка микроконтроллера успешно завершена!")
+                        self.show_dialog("success", "Успешно", "Прошивка микроконтроллера успешно завершена!")
                     else:
                         self.phase_lbl.config(text="❌ Ошибка прошивки")
                         self.status_left.config(text="Ошибка во время прошивки")
-                        messagebox.showerror("Ошибка", f"{msg}. Подробности см. в журнале операций.")
+                        self.show_dialog("error", "Ошибка", f"{msg}. Подробности см. в журнале операций.")
 
         except queue.Empty:
             pass
+        finally:
+            self._pq_running = False
+            try:
+                alive = self.root.winfo_exists()
+            except tk.TclError:
+                alive = False
+            if alive:
+                # Apply coalesced updates after the drain so widgets are
+                # touched once per tick, then keep the single poll chain alive.
+                if pending_phase is not None:
+                    _, phase_text, step, total = pending_phase
+                    self.phase_lbl.config(text=f"Этап [{step}/{total}]: {phase_text}")
 
-        if pending_phase is not None:
-            _, phase_text, step, total = pending_phase
-            self.phase_lbl.config(text=f"Этап [{step}/{total}]: {phase_text}")
+                if pending_progress is not None:
+                    _, pct, detail = pending_progress
+                    self.progress["value"] = pct
+                    self.pct_lbl.config(text=f"{pct}%")
+                    if detail:
+                        self.detail_lbl.config(text=detail)
 
-        if pending_progress is not None:
-            _, pct, detail = pending_progress
-            self.progress["value"] = pct
-            self.pct_lbl.config(text=f"{pct}%")
-            if detail:
-                self.detail_lbl.config(text=detail)
-
-        self.root.after(40, self.process_queue)
+                self.root.after(40, self.process_queue)
 
 
 def main():
