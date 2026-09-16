@@ -39,7 +39,7 @@ from proteus32_protocol import (
     send_packet,
 )
 
-VERSION = "2.2"
+VERSION = "2.2.1"
 BOOTLOADER_BAUD = 460800  # The only rate the fixed BRR (0x34 @ HSI 24 MHz) supports
 MAX_LOG_LINES = 2000      # log widget cap; oldest lines are dropped beyond it
 
@@ -384,7 +384,7 @@ class ThemedMessageBox(tk.Toplevel):
 class FlasherApp:
     def __init__(self, root):
         self.root = root
-        self.root.title(f"CH32V003 Bootloader Flasher v{VERSION}")
+        self.root.title(f"Proteus 32 Flasher v{VERSION}")
         self.root.geometry("720x650")
         self.root.minsize(640, 570)
 
@@ -436,7 +436,7 @@ class FlasherApp:
         title_box = ttk.Frame(header_frame)
         title_box.grid(row=0, column=0, sticky="w")
 
-        title_lbl = ttk.Label(title_box, text="⚡ CH32V003 Flasher", font=title_font)
+        title_lbl = ttk.Label(title_box, text="⚡ Proteus 32 Flasher", font=title_font)
         title_lbl.pack(side=tk.LEFT)
 
         proto_badge = ttk.Label(
@@ -472,6 +472,7 @@ class FlasherApp:
             font=ui_font,
         )
         self.port_combo.grid(row=0, column=1, sticky="ew", padx=(0, 6), pady=4)
+        self.port_combo.bind("<<ComboboxSelected>>", self._clear_combo_highlight)
 
         self.refresh_btn = ttk.Button(conn_frame, text="Обновить", command=self.refresh_ports, width=10)
         self.refresh_btn.grid(row=0, column=2, sticky="e", padx=(0, 6), pady=4)
@@ -487,7 +488,7 @@ class FlasherApp:
 
         baud_val_lbl = ttk.Label(
             baud_info_box,
-            text="460800 бод (фиксировано загрузчиком BRR=0x34)",
+            text="460800 бод (фиксировано загрузчиком)",
             font=("Segoe UI", 9, "italic"),
         )
         baud_val_lbl.pack(side=tk.LEFT)
@@ -760,6 +761,11 @@ class FlasherApp:
         except Exception as e:
             self.file_info_lbl.config(text=f"Ошибка чтения файла: {e}", foreground="#C42B1C")
             return False
+
+    def _clear_combo_highlight(self, _event=None):
+        """Drop the persistent blue selection/focus highlight of the readonly combobox."""
+        self.port_combo.selection_clear()
+        self.root.focus_set()
 
     def refresh_ports(self):
         ports = serial.tools.list_ports.comports()
