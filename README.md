@@ -1,5 +1,7 @@
 # CH32V003 Flasher GUI
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 Графический интерфейс для прошивки микроконтроллеров CH32V003 через UART.
 
 ![Скриншот программы](screenshot.jpg)
