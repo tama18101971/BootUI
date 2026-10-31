@@ -17,6 +17,9 @@ dist/
 # Serena (agent tooling) local state
 .serena/
 
+# Kilo (agent tooling) local plans
+.kilo/plans/
+
 # C/C++ language server (clangd) — machine-local state, never shared.
 # clangd writes its background index to .cache/clangd/index/ (clangd 11+);
 # clangd 9/10 used .clangd/index/. Both are transient and safe to delete.
